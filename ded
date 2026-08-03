@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# Wrapper for ded — pass --config from your deploy project.
+set -euo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+_load_env_file() {
+  local file="$1"
+  [[ -f "$file" ]] || return 1
+  eval "$(python3 "$ROOT/ded.py" shell-export "$file")"
+}
+
+if [[ -n "${DED_ENV:-}" ]]; then
+  _load_env_file "${DED_ENV}" || true
+elif [[ -n "${DEPLOYD_ENV:-}" ]]; then
+  _load_env_file "${DEPLOYD_ENV}" || true
+fi
+
+BOT_HOST="${BOT_HOST:-${DEPLOY_SSH_HOST:-}}"
+ANSIBLE_USER="${ANSIBLE_USER:-${DEPLOY_SSH_USER:-root}}"
+ANSIBLE_SSH_PORT="${ANSIBLE_SSH_PORT:-${DEPLOY_SSH_PORT:-22}}"
+SSH_PRIVATE_KEY_FILE="${SSH_PRIVATE_KEY_FILE:-${DEPLOY_SSH_KEY_FILE:-}}"
+if [[ -z "${SSH_PRIVATE_KEY:-}" && -n "${DEPLOY_SSH_KEY:-}" ]]; then
+  SSH_PRIVATE_KEY="${DEPLOY_SSH_KEY}"
+fi
+if [[ -n "${SSH_PRIVATE_KEY_FILE:-}" ]]; then
+  case "$SSH_PRIVATE_KEY_FILE" in
+    "~") SSH_PRIVATE_KEY_FILE="$HOME" ;;
+    "~/"*) SSH_PRIVATE_KEY_FILE="$HOME/${SSH_PRIVATE_KEY_FILE#~/}" ;;
+  esac
+fi
+
+if [[ "${1:-}" == *.env && "${2:-}" =~ ^(validate|status|once|start|deploy|ci-check)$ ]]; then
+  echo "ded: env file must use --env-file, not a positional argument." >&2
+  echo "  ./ded --env-file $1 ${2}" >&2
+  exit 2
+fi
+
+exec python3 "$ROOT/ded.py" "$@"
