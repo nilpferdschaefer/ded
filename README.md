@@ -47,6 +47,8 @@ Options:
 - `--workers` — process multiple repos in parallel (`once` / `start`; default from config)
 - `--ui` / `--plain` — terminal UI with per-repo logs is enabled on a TTY by default; use `--plain` to force plain output or `--ui` to force the UI
 
+In the UI: **Tab** switches between the project list and log pane; **↑↓** scrolls the focused pane; **PgUp/PgDn** pages; **Home/End** jump to top/bottom; mouse wheel scrolls the pane under the cursor. Scrollbars appear when content overflows.
+
 ## Configuration schema
 
 See **[docs/config.md](docs/config.md)** for field reference and a minimal generic
