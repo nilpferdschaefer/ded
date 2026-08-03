@@ -44,6 +44,10 @@ Options:
 - `--env-file` — deploy credentials dotenv (or `DED_ENV`)
 - `--dry-run` — log without calling `gh` / deploy
 - `--repo` — limit `once` / `start` to specific repo keys
+- `--workers` — process multiple repos in parallel (`once` / `start`; default from config)
+- `--ui` / `--plain` — terminal UI with per-repo logs is enabled on a TTY by default; use `--plain` to force plain output or `--ui` to force the UI
+
+In the UI: **Tab** switches between the project list and log pane; **↑↓** scrolls the focused pane; **PgUp/PgDn** pages; **Home/End** jump to top/bottom; mouse wheel scrolls the pane under the cursor. Scrollbars appear when content overflows. Press **a** on a selected project to launch a Cursor cloud agent with that service's logs as context (requires `CURSOR_API_KEY` in your env file).
 
 ## Configuration schema
 
