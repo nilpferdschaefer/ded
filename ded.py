@@ -35,7 +35,7 @@ RELEASE_FLAG_TO_CLI = {
     "executor_release": "executor-release",
 }
 
-DED_VERSION = "1.0.0"
+DED_VERSION = "2.0.0"
 
 _current_repo: contextvars.ContextVar[str | None] = contextvars.ContextVar("ded_repo", default=None)
 _log_sink: DedLogSink | None = None
