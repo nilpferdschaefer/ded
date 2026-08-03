@@ -45,6 +45,7 @@ Options:
 - `--dry-run` — log without calling `gh` / deploy
 - `--repo` — limit `once` / `start` to specific repo keys
 - `--workers` — process multiple repos in parallel (`once` / `start`; default from config)
+- `--ui` / `--plain` — terminal UI with per-repo logs is enabled on a TTY by default; use `--plain` to force plain output or `--ui` to force the UI
 
 ## Configuration schema
 

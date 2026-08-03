@@ -11,6 +11,7 @@ Requires: gh (authenticated), --config pointing to your project's ded.json.
 from __future__ import annotations
 
 import argparse
+import contextvars
 import json
 import os
 import subprocess
@@ -21,7 +22,10 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ded_tui import DedLogSink
 
 
 RELEASE_FLAG_TO_CLI = {
@@ -32,6 +36,9 @@ RELEASE_FLAG_TO_CLI = {
 }
 
 DED_VERSION = "1.0.0"
+
+_current_repo: contextvars.ContextVar[str | None] = contextvars.ContextVar("ded_repo", default=None)
+_log_sink: DedLogSink | None = None
 
 DEPLOY_ENV_KEYS = (
     "BOT_HOST",
@@ -50,7 +57,16 @@ def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def log(msg: str) -> None:
+def set_log_sink(sink: DedLogSink | None) -> None:
+    global _log_sink
+    _log_sink = sink
+
+
+def log(msg: str, *, repo: str | None = None) -> None:
+    repo_key = repo or _current_repo.get()
+    if _log_sink is not None:
+        _log_sink.emit(msg, repo=repo_key)
+        return
     print(f"[ded {utc_now()}] {msg}", flush=True)
 
 
@@ -218,10 +234,34 @@ def run(
     env: dict[str, str] | None = None,
     check: bool = True,
     capture: bool = False,
+    stream: bool | None = None,
 ) -> subprocess.CompletedProcess[str]:
     merged = os.environ.copy()
     if env:
         merged.update(env)
+    repo_key = _current_repo.get()
+    if stream is None:
+        stream = _log_sink is not None and repo_key is not None and not capture
+    if stream:
+        proc = subprocess.Popen(
+            cmd,
+            cwd=str(cwd) if cwd else None,
+            env=merged,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            text = line.rstrip("\n")
+            if text:
+                log(text, repo=repo_key)
+        proc.wait()
+        if check and proc.returncode != 0:
+            raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}")
+        return subprocess.CompletedProcess(cmd, proc.returncode or 0, "", "")
+
     result = subprocess.run(
         cmd,
         cwd=str(cwd) if cwd else None,
@@ -232,6 +272,13 @@ def run(
     if check and result.returncode != 0:
         detail = (result.stderr or "").strip() or (result.stdout or "").strip()
         raise RuntimeError(f"command failed ({result.returncode}): {' '.join(cmd)}\n{detail}")
+    if capture and _log_sink is not None and repo_key is not None:
+        for line in (result.stdout or "").splitlines():
+            if line.strip():
+                log(line, repo=repo_key)
+        for line in (result.stderr or "").splitlines():
+            if line.strip():
+                log(line, repo=repo_key)
     return result
 
 
@@ -891,7 +938,7 @@ class DeployDaemon:
             return
         run(cmd, cwd=self.config.stack_root, capture=False)
 
-    def process_repo(self, key: str) -> None:
+    def process_repo(self, key: str) -> str | None:
         ctx = self.ctx_for(key)
         st = self.state.repo(key)
         head_sha = self.latest_sha(ctx)
@@ -900,23 +947,24 @@ class DeployDaemon:
 
         last_deployed = st.get("last_deployed_sha")
         if last_deployed == head_sha:
-            return
+            return None
 
         watch_paths = ctx.cfg.get("watch_paths") or []
         build = ctx.cfg.get("build")
         deploy_cfg = ctx.cfg.get("deploy") or {}
 
         if watch_paths and not self.paths_changed(ctx, head_sha, watch_paths):
-            log(f"{ctx.key}: {head_sha[:7]} has no changes under {watch_paths} — skip")
+            log(f"{head_sha[:7]} has no changes under {watch_paths} — skip", repo=ctx.key)
             st["last_seen_sha"] = head_sha
             st["last_skipped_sha"] = head_sha
             st["last_skipped_at"] = utc_now()
             self.state.save()
-            return
+            return "skip"
 
         log(
-            f"{ctx.key}: new work at {head_sha[:7]} "
-            f"(last deployed {str(last_deployed)[:7] if last_deployed else 'none'})"
+            f"new work at {head_sha[:7]} "
+            f"(last deployed {str(last_deployed)[:7] if last_deployed else 'none'})",
+            repo=ctx.key,
         )
         release_tag: str | None = None
         ci_sha = head_sha
@@ -934,16 +982,16 @@ class DeployDaemon:
             if artifact == "release":
                 self.wait_for_release(ctx, release_tag, assets)
             elif artifact == "ghcr":
-                log(f"{ctx.key}: CI OK — RAM image expected at GHCR tag {release_tag}")
+                log(f"CI OK — RAM image expected at GHCR tag {release_tag}", repo=ctx.key)
             elif artifact == "none":
-                log(f"{ctx.key}: CI OK — no release artifact to wait for")
+                log(f"CI OK — no release artifact to wait for", repo=ctx.key)
             else:
                 raise RuntimeError(f"unsupported build artifact type: {artifact}")
             self.trigger_downstream(ctx)
 
         deploy_mode = deploy_cfg.get("mode", "ansible")
         if deploy_mode == "none":
-            log(f"{ctx.key}: build-only — skipping Ansible deploy")
+            log("build-only — skipping Ansible deploy", repo=ctx.key)
         elif deploy_mode == "ansible":
             self.ansible_deploy(deploy_cfg, release_tag=release_tag)
         else:
@@ -957,17 +1005,32 @@ class DeployDaemon:
         st["last_deploy_at"] = utc_now()
         st.pop("last_error", None)
         self.state.save()
-        log(f"{ctx.key}: complete at {head_sha[:7]}")
+        log(f"complete at {head_sha[:7]}", repo=ctx.key)
+        return "ok"
 
     def _process_repo_safe(self, key: str) -> None:
+        token = _current_repo.set(key)
+        if _log_sink is not None:
+            _log_sink.set_repo_status(key, "running")
         try:
-            self.process_repo(key)
+            outcome = self.process_repo(key)
+            if _log_sink is not None:
+                if outcome == "skip":
+                    _log_sink.set_repo_status(key, "skip")
+                elif outcome == "ok":
+                    _log_sink.set_repo_status(key, "ok")
+                else:
+                    _log_sink.set_repo_status(key, "idle")
         except Exception as exc:  # noqa: BLE001 — daemon should continue
-            log(f"{key}: failed: {exc}")
+            log(f"failed: {exc}", repo=key)
+            if _log_sink is not None:
+                _log_sink.set_repo_status(key, "error")
             st = self.state.repo(key)
             st["last_error"] = str(exc)
             st["last_error_at"] = utc_now()
             self.state.save()
+        finally:
+            _current_repo.reset(token)
 
     def process_all(self, only: list[str] | None = None, *, workers: int = 1) -> None:
         keys = only or list(self.config.repos.keys())
@@ -1097,6 +1160,8 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="parallel repo workers (default: workers from config, or 1)",
     )
+    sp.add_argument("--ui", action="store_true", help="terminal UI with per-repo log panes")
+    sp.add_argument("--plain", action="store_true", help="plain interleaved logs (disable UI)")
 
     sp = sub.add_parser("deploy", parents=[common], help="deploy a specific release tag (skip CI)")
     sp.add_argument("repo_key", help="configured repo key from ded.json")
@@ -1114,8 +1179,63 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="parallel repo workers (default: workers from config, or 1)",
     )
+    sp.add_argument("--ui", action="store_true", help="terminal UI with per-repo log panes")
+    sp.add_argument("--plain", action="store_true", help="plain interleaved logs (disable UI)")
 
     return p
+
+
+def should_use_ui(args: argparse.Namespace) -> bool:
+    if getattr(args, "plain", False):
+        return False
+    if getattr(args, "ui", False):
+        return True
+    if args.command not in {"once", "start"}:
+        return False
+    return sys.stdout.isatty() and sys.stdin.isatty()
+
+
+def run_poll_with_ui(
+    daemon: DeployDaemon,
+    *,
+    repo_keys: list[str],
+    workers: int,
+    interval: int,
+    network: str,
+    continuous: bool,
+) -> None:
+    from ded_tui import DedLogSink, run_tui
+
+    sink = DedLogSink(repo_keys, timestamp_fn=utc_now)
+    set_log_sink(sink)
+    stop = threading.Event()
+    sink.set_header(
+        f"ded {DED_VERSION}  network={network}  workers={workers}"
+        + (f"  interval={interval}s" if continuous else "")
+    )
+
+    def worker() -> None:
+        try:
+            while not stop.is_set():
+                daemon.process_all(only=repo_keys, workers=workers)
+                if not continuous:
+                    sink.set_footer("Done — press q to quit")
+                    break
+                if stop.wait(interval):
+                    break
+        except Exception as exc:  # noqa: BLE001 — surface in UI instead of breaking curses
+            sink.emit(f"ERROR: poll loop failed: {exc}")
+            sink.set_footer("Error — press q to quit")
+            stop.set()
+
+    thread = threading.Thread(target=worker, name="ded-poll", daemon=True)
+    thread.start()
+    try:
+        run_tui(sink, stop=stop)
+    finally:
+        stop.set()
+        thread.join(timeout=5)
+        set_log_sink(None)
 
 
 def main() -> None:
@@ -1209,6 +1329,17 @@ def main() -> None:
         workers = args.workers if args.workers is not None else config.workers
         if workers < 1:
             die(f"--workers must be >= 1, got {workers}")
+        repo_keys = args.repo or list(config.repos.keys())
+        if should_use_ui(args):
+            run_poll_with_ui(
+                daemon,
+                repo_keys=repo_keys,
+                workers=workers,
+                interval=0,
+                network=config.network,
+                continuous=False,
+            )
+            return
         daemon.process_all(only=args.repo, workers=workers)
         return
 
@@ -1217,6 +1348,17 @@ def main() -> None:
         workers = args.workers if args.workers is not None else config.workers
         if workers < 1:
             die(f"--workers must be >= 1, got {workers}")
+        repo_keys = args.repo or list(config.repos.keys())
+        if should_use_ui(args):
+            run_poll_with_ui(
+                daemon,
+                repo_keys=repo_keys,
+                workers=workers,
+                interval=interval,
+                network=config.network,
+                continuous=True,
+            )
+            return
         log(f"starting ded (interval={interval}s, network={config.network}, workers={workers})")
         while True:
             daemon.process_all(only=args.repo, workers=workers)
