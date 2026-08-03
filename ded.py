@@ -1204,15 +1204,44 @@ def run_poll_with_ui(
     network: str,
     continuous: bool,
 ) -> None:
+    from ded_cursor import CursorAgentSettings
     from ded_tui import DedLogSink, run_tui
 
     sink = DedLogSink(repo_keys, timestamp_fn=utc_now)
     set_log_sink(sink)
     stop = threading.Event()
+    agent_settings = CursorAgentSettings.from_config(daemon.config.raw)
+    launching_agents: set[str] = set()
+    launch_lock = threading.Lock()
+
     sink.set_header(
         f"ded {DED_VERSION}  network={network}  workers={workers}"
         + (f"  interval={interval}s" if continuous else "")
     )
+    if os.environ.get(agent_settings.api_key_env, "").strip():
+        sink.set_footer("Press a on a project to launch a Cursor agent with its logs")
+    else:
+        sink.set_footer(f"Set {agent_settings.api_key_env} to enable Cursor agent launch (a)")
+
+    def launch_cursor_agent(repo_key: str) -> None:
+        with launch_lock:
+            if repo_key in launching_agents:
+                sink.set_footer(f"Cursor agent for {repo_key} is already launching…")
+                return
+            launching_agents.add(repo_key)
+
+        def work() -> None:
+            try:
+                _launch_cursor_agent(sink, daemon, repo_key, agent_settings)
+            finally:
+                with launch_lock:
+                    launching_agents.discard(repo_key)
+
+        threading.Thread(
+            target=work,
+            daemon=True,
+            name=f"cursor-agent-{repo_key}",
+        ).start()
 
     def worker() -> None:
         try:
@@ -1231,11 +1260,69 @@ def run_poll_with_ui(
     thread = threading.Thread(target=worker, name="ded-poll", daemon=True)
     thread.start()
     try:
-        run_tui(sink, stop=stop)
+        run_tui(sink, stop=stop, on_launch_agent=launch_cursor_agent)
     finally:
         stop.set()
         thread.join(timeout=5)
         set_log_sink(None)
+
+
+def _launch_cursor_agent(
+    sink: DedLogSink,
+    daemon: DeployDaemon,
+    repo_key: str,
+    settings: "CursorAgentSettings",
+) -> None:
+    from ded_cursor import (
+        agent_url_from_response,
+        build_agent_prompt,
+        create_cloud_agent,
+        open_agent_url,
+        repo_agent_target,
+    )
+
+    api_key = os.environ.get(settings.api_key_env, "").strip()
+    if not api_key:
+        sink.emit(
+            f"Cursor agent: set {settings.api_key_env} in ded.env "
+            "(Cursor Dashboard → API Keys)",
+        )
+        sink.set_footer(f"Missing {settings.api_key_env}")
+        return
+
+    repo_cfg = daemon.config.repos.get(repo_key)
+    if repo_cfg is None:
+        sink.emit(f"Cursor agent: unknown repo key {repo_key}")
+        return
+
+    target = repo_agent_target(
+        repo_key,
+        github_owner=daemon.config.github_owner,
+        repo_cfg=repo_cfg,
+    )
+    prompt = build_agent_prompt(
+        target=target,
+        network=daemon.config.network,
+        logs=sink.log_text_for_repo(repo_key),
+        state=dict(daemon.state.repo(repo_key)),
+        max_chars=settings.max_log_chars,
+    )
+
+    sink.set_footer(f"Creating Cursor agent for {repo_key}…")
+    try:
+        result = create_cloud_agent(
+            api_key,
+            prompt_text=prompt,
+            target=target,
+            model=settings.model,
+        )
+        url = agent_url_from_response(result)
+        opened = open_agent_url(url)
+        sink.emit(f"Cursor agent created: {url}", repo=repo_key)
+        sink.set_footer("Agent opened in browser" if opened else f"Agent ready: {url}")
+    except Exception as exc:  # noqa: BLE001 — show in UI
+        sink.emit(f"Cursor agent failed: {exc}", repo=repo_key)
+        sink.set_footer(f"Agent failed: {exc}")
 
 
 def main() -> None:

@@ -19,6 +19,7 @@ ded --config /path/to/your-project/config/ded.json …
 | `poll_interval_sec` | Loop interval for `start` (default 90) |
 | `workers` | Parallel repo workers for `once` / `start` (default 1; override with `--workers`) |
 | `network` | Opaque string passed to your deploy script (e.g. `testnet`) |
+| `cursor` | Optional Cursor agent launch settings (see below) |
 | `stack_root` | Root of your deploy project (relative to config file; default `..`) |
 | `state_dir` | Persisted state directory (relative to `stack_root`) |
 | `repos` | Map of repo keys → build/deploy definitions |
@@ -41,6 +42,30 @@ ded --config /path/to/your-project/config/ded.json …
 | `deploy.app_tags` | Tag filter list for Ansible |
 | `deploy.release_flag` | Maps to `--<flag>=<tag>` on deploy script |
 | `trigger_after_build` | Downstream `gh workflow run` after CI |
+
+## Cursor agents (optional)
+
+In the TUI, press **a** on a selected project to launch a [Cursor cloud agent](https://cursor.com/docs/cloud-agent) with that service's ded logs as the starting prompt.
+
+Set an API key in your project's `ded.env` (from [Cursor Dashboard → API Keys](https://cursor.com/dashboard/api)):
+
+```bash
+CURSOR_API_KEY=your_api_key
+```
+
+Optional `cursor` block in `ded.json`:
+
+```json
+{
+  "cursor": {
+    "api_key_env": "CURSOR_API_KEY",
+    "model": "composer-2.5",
+    "max_log_chars": 48000
+  }
+}
+```
+
+Per-repo overrides: `cursor_repo_url` or `repo_url` if the GitHub URL is not `https://github.com/<github_owner>/<repo>`.
 
 ## Minimal example
 

@@ -198,6 +198,25 @@ class DedLogSink:
             panel.follow = not to_top
             self._dirty.set()
 
+    def selected_key(self) -> str | None:
+        with self._lock:
+            if not self._repos:
+                return None
+            return self._repos[self._selected]
+
+    def log_text_for_repo(self, key: str) -> str:
+        with self._lock:
+            panel = self._panels.get(key)
+            lines: list[str] = []
+            if panel:
+                lines.extend(panel.lines)
+            if self._system_lines:
+                if lines:
+                    lines.append("")
+                lines.append("— system —")
+                lines.extend(self._system_lines)
+            return "\n".join(lines)
+
     def _log_line_count_locked(self, panel: RepoPanel) -> int:
         total = len(panel.lines)
         if self._system_lines:
@@ -359,7 +378,7 @@ def _draw(stdscr: curses.window, snap: TuiSnapshot) -> None:
         )
 
     footer = snap.footer or (
-        "Tab switch pane  ↑↓ scroll  PgUp/PgDn page  Home/End top/bottom  q quit"
+        "Tab switch pane  ↑↓ scroll  PgUp/PgDn page  a Cursor agent  q quit"
     )
     stdscr.addstr(height - 1, 0, _truncate(footer, width - 1), curses.A_DIM)
     stdscr.refresh()
@@ -418,7 +437,12 @@ def _handle_mouse(
         sink.scroll_logs(delta, viewport=list_height)
 
 
-def run_tui(sink: DedLogSink, *, stop: threading.Event) -> None:
+def run_tui(
+    sink: DedLogSink,
+    *,
+    stop: threading.Event,
+    on_launch_agent: Callable[[str], None] | None = None,
+) -> None:
     """Run the curses UI until the user quits or stop is set."""
 
     def _loop(stdscr: curses.window) -> None:
@@ -455,6 +479,11 @@ def run_tui(sink: DedLogSink, *, stop: threading.Event) -> None:
                 break
             if key == ord("\t"):
                 sink.toggle_focus()
+                continue
+            if on_launch_agent is not None and key in {ord("a"), ord("A")}:
+                repo_key = sink.selected_key()
+                if repo_key:
+                    on_launch_agent(repo_key)
                 continue
             if key == curses.KEY_MOUSE:
                 _handle_mouse(
