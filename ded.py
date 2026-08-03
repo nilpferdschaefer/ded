@@ -15,7 +15,9 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -288,6 +290,7 @@ class DeployConfig:
     raw: dict[str, Any]
     github_owner: str
     poll_interval_sec: int
+    workers: int
     network: str
     stack_root: Path
     state_dir: Path
@@ -301,10 +304,14 @@ class DeployConfig:
         state_dir = Path(data.get("state_dir", ".ded"))
         if not state_dir.is_absolute():
             state_dir = (stack_root / state_dir).resolve()
+        workers = int(data.get("workers", 1))
+        if workers < 1:
+            die(f"config {path}: workers must be >= 1, got {workers}")
         return cls(
             raw=data,
             github_owner=data["github_owner"],
             poll_interval_sec=int(data.get("poll_interval_sec", 90)),
+            workers=workers,
             network=data.get("network", "testnet"),
             stack_root=stack_root,
             state_dir=state_dir,
@@ -315,6 +322,7 @@ class DeployConfig:
 class StateStore:
     def __init__(self, path: Path) -> None:
         self.path = path
+        self._lock = threading.Lock()
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.data: dict[str, Any] = {"repos": {}}
         if self.path.exists():
@@ -325,7 +333,8 @@ class StateStore:
         return repos.setdefault(name, {})
 
     def save(self) -> None:
-        self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
+        with self._lock:
+            self.path.write_text(json.dumps(self.data, indent=2, sort_keys=True) + "\n")
 
 
 @dataclass
@@ -950,19 +959,33 @@ class DeployDaemon:
         self.state.save()
         log(f"{ctx.key}: complete at {head_sha[:7]}")
 
-    def process_all(self, only: list[str] | None = None) -> None:
+    def _process_repo_safe(self, key: str) -> None:
+        try:
+            self.process_repo(key)
+        except Exception as exc:  # noqa: BLE001 — daemon should continue
+            log(f"{key}: failed: {exc}")
+            st = self.state.repo(key)
+            st["last_error"] = str(exc)
+            st["last_error_at"] = utc_now()
+            self.state.save()
+
+    def process_all(self, only: list[str] | None = None, *, workers: int = 1) -> None:
         keys = only or list(self.config.repos.keys())
         for key in keys:
             if key not in self.config.repos:
                 die(f"unknown repo key: {key}")
-            try:
-                self.process_repo(key)
-            except Exception as exc:  # noqa: BLE001 — daemon should continue
-                log(f"{key}: failed: {exc}")
-                st = self.state.repo(key)
-                st["last_error"] = str(exc)
-                st["last_error_at"] = utc_now()
-                self.state.save()
+
+        if workers <= 1 or len(keys) <= 1:
+            for key in keys:
+                self._process_repo_safe(key)
+            return
+
+        effective_workers = min(workers, len(keys))
+        log(f"processing {len(keys)} repo(s) with {effective_workers} worker(s)")
+        with ThreadPoolExecutor(max_workers=effective_workers) as pool:
+            futures = [pool.submit(self._process_repo_safe, key) for key in keys]
+            for future in as_completed(futures):
+                future.result()
 
     def status(self) -> None:
         for key in self.config.repos:
@@ -1068,6 +1091,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("once", parents=[common], help="poll all repos once and exit")
     sp.add_argument("--repo", action="append", help="limit to repo key(s)")
+    sp.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="parallel repo workers (default: workers from config, or 1)",
+    )
 
     sp = sub.add_parser("deploy", parents=[common], help="deploy a specific release tag (skip CI)")
     sp.add_argument("repo_key", help="configured repo key from ded.json")
@@ -1079,6 +1108,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("start", parents=[common], help="run continuous poll loop")
     sp.add_argument("--repo", action="append", help="limit to repo key(s)")
     sp.add_argument("--interval", type=int, default=None, help="override poll interval seconds")
+    sp.add_argument(
+        "--workers",
+        type=int,
+        default=None,
+        help="parallel repo workers (default: workers from config, or 1)",
+    )
 
     return p
 
@@ -1171,14 +1206,20 @@ def main() -> None:
         return
 
     if args.command == "once":
-        daemon.process_all(only=args.repo)
+        workers = args.workers if args.workers is not None else config.workers
+        if workers < 1:
+            die(f"--workers must be >= 1, got {workers}")
+        daemon.process_all(only=args.repo, workers=workers)
         return
 
     if args.command == "start":
         interval = args.interval or config.poll_interval_sec
-        log(f"starting ded (interval={interval}s, network={config.network})")
+        workers = args.workers if args.workers is not None else config.workers
+        if workers < 1:
+            die(f"--workers must be >= 1, got {workers}")
+        log(f"starting ded (interval={interval}s, network={config.network}, workers={workers})")
         while True:
-            daemon.process_all(only=args.repo)
+            daemon.process_all(only=args.repo, workers=workers)
             time.sleep(interval)
         return
 

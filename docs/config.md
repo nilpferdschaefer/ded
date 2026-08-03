@@ -17,6 +17,7 @@ ded --config /path/to/your-project/config/ded.json …
 |-------|---------|
 | `github_owner` | GitHub org/user for all `repos.*.repo` |
 | `poll_interval_sec` | Loop interval for `start` (default 90) |
+| `workers` | Parallel repo workers for `once` / `start` (default 1; override with `--workers`) |
 | `network` | Opaque string passed to your deploy script (e.g. `testnet`) |
 | `stack_root` | Root of your deploy project (relative to config file; default `..`) |
 | `state_dir` | Persisted state directory (relative to `stack_root`) |

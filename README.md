@@ -44,6 +44,7 @@ Options:
 - `--env-file` — deploy credentials dotenv (or `DED_ENV`)
 - `--dry-run` — log without calling `gh` / deploy
 - `--repo` — limit `once` / `start` to specific repo keys
+- `--workers` — process multiple repos in parallel (`once` / `start`; default from config)
 
 ## Configuration schema
 
