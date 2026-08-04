@@ -85,6 +85,10 @@ def build_agent_prompt(
         "last_deployed_sha",
         "last_deployed_tag",
         "last_deploy_at",
+        "last_deploy_duration_sec",
+        "last_ci_wait_sec",
+        "last_release_wait_sec",
+        "last_ansible_deploy_sec",
         "last_error",
         "last_error_at",
     ):
@@ -94,6 +98,25 @@ def build_agent_prompt(
         lines.append("Latest ded state:")
         lines.extend(state_lines)
         lines.append("")
+
+    timings = state.get("last_timings")
+    if isinstance(timings, dict):
+        stages = timings.get("stages") or {}
+        timing_bits = []
+        if "total_sec" in timings:
+            timing_bits.append(f"total={timings['total_sec']:.1f}s")
+        for key in ("ci_wait_sec", "release_wait_sec", "ansible_deploy_sec"):
+            if key in stages:
+                timing_bits.append(f"{key}={stages[key]:.1f}s")
+        if timing_bits:
+            lines.append("Last deploy timings: " + ", ".join(timing_bits))
+        tasks = stages.get("ansible_tasks") or []
+        if tasks:
+            lines.append("Slowest ansible tasks:")
+            for task in tasks[:5]:
+                lines.append(f"- {task['task']}: {task['duration_sec']:.1f}s")
+        if timing_bits or tasks:
+            lines.append("")
 
     lines.extend(
         [
