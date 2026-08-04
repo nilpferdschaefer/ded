@@ -14,6 +14,7 @@ import argparse
 import contextvars
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -22,7 +23,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, TYPE_CHECKING
+from typing import Any, Callable, TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ded_tui import DedLogSink
@@ -55,6 +56,67 @@ DEPLOY_ENV_KEYS = (
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def format_duration(sec: float) -> str:
+    if sec < 60:
+        return f"{sec:.1f}s"
+    minutes, remainder = divmod(sec, 60)
+    if minutes < 60:
+        return f"{int(minutes)}m{remainder:.0f}s"
+    hours, remainder = divmod(minutes, 60)
+    return f"{int(hours)}h{int(remainder)}m"
+
+
+def ansible_profile_callbacks_env() -> dict[str, str]:
+    """Enable Ansible profile_tasks so per-task durations appear in deploy output."""
+    existing = os.environ.get("ANSIBLE_CALLBACKS_ENABLED", "")
+    callbacks = [part.strip() for part in existing.split(",") if part.strip()]
+    if "profile_tasks" not in callbacks:
+        callbacks.append("profile_tasks")
+    return {"ANSIBLE_CALLBACKS_ENABLED": ",".join(callbacks)}
+
+
+class AnsibleTimingCollector:
+    """Parse profile_tasks summary lines from ansible-playbook output."""
+
+    _TASK_SUMMARY_RE = re.compile(r"^(.+?)\s+(\d+(?:\.\d+)?)s\s*$")
+    _PLAYBOOK_TOTAL_RE = re.compile(
+        r"^Playbook run took .*? (\d+):(\d{2}):(\d+(?:\.\d+)?)\s*$"
+    )
+
+    def __init__(self) -> None:
+        self.tasks: list[dict[str, Any]] = []
+        self.playbook_duration_sec: float | None = None
+
+    def feed(self, line: str) -> None:
+        stripped = line.strip()
+        playbook_match = self._PLAYBOOK_TOTAL_RE.match(stripped)
+        if playbook_match:
+            hours, minutes, seconds = playbook_match.groups()
+            self.playbook_duration_sec = int(hours) * 3600 + int(minutes) * 60 + float(seconds)
+            return
+
+        task_match = self._TASK_SUMMARY_RE.match(stripped)
+        if not task_match:
+            return
+        task_name = task_match.group(1).strip()
+        if not task_name or task_name.startswith("Playbook run took"):
+            return
+        duration = float(task_match.group(2))
+        self.tasks.append({"task": task_name, "duration_sec": round(duration, 4)})
+
+    def as_dict(self) -> dict[str, Any]:
+        out: dict[str, Any] = {}
+        if self.playbook_duration_sec is not None:
+            out["ansible_playbook_sec"] = round(self.playbook_duration_sec, 2)
+        if self.tasks:
+            out["ansible_tasks"] = sorted(
+                self.tasks,
+                key=lambda item: item["duration_sec"],
+                reverse=True,
+            )
+        return out
 
 
 def set_log_sink(sink: DedLogSink | None) -> None:
@@ -280,6 +342,47 @@ def run(
             if line.strip():
                 log(line, repo=repo_key)
     return result
+
+
+def run_streaming(
+    cmd: list[str],
+    *,
+    cwd: Path | None = None,
+    env: dict[str, str] | None = None,
+    on_line: Callable[[str], None] | None = None,
+    check: bool = True,
+) -> float:
+    """Run a command, stream each output line, and return wall-clock duration in seconds."""
+    merged = os.environ.copy()
+    if env:
+        merged.update(env)
+    repo_key = _current_repo.get()
+    start = time.perf_counter()
+    proc = subprocess.Popen(
+        cmd,
+        cwd=str(cwd) if cwd else None,
+        env=merged,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+    )
+    assert proc.stdout is not None
+    for line in proc.stdout:
+        text = line.rstrip("\n")
+        if not text:
+            continue
+        if on_line is not None:
+            on_line(text)
+        elif _log_sink is not None:
+            log(text, repo=repo_key)
+        else:
+            print(text, flush=True)
+    proc.wait()
+    duration = time.perf_counter() - start
+    if check and proc.returncode != 0:
+        raise RuntimeError(f"command failed ({proc.returncode}): {' '.join(cmd)}")
+    return duration
 
 
 def require_tool(name: str) -> None:
@@ -776,13 +879,14 @@ class DeployDaemon:
         msg = str(exc)
         return "workflow_dispatch" in msg or "Workflow does not have" in msg
 
-    def wait_for_workflow(self, ctx: RepoContext, sha: str, workflow: str, timeout_sec: int = 7200) -> str:
+    def wait_for_workflow(self, ctx: RepoContext, sha: str, workflow: str, timeout_sec: int = 7200) -> tuple[str, float]:
         build = ctx.cfg.get("build") or {}
         trigger_mode = self.build_trigger_mode(build)
         deadline = time.time() + timeout_sec
         trigger_attempted = False
         logged_waiting = False
         poll_sec = 30
+        start = time.perf_counter()
 
         while time.time() < deadline:
             runs = self.workflow_runs_for_commit(ctx, sha, workflow)
@@ -846,14 +950,21 @@ class DeployDaemon:
             log(f"{ctx.key}: workflow {run_id} status={status} conclusion={conclusion}")
             if status == "completed":
                 if conclusion == "success":
-                    return sha
+                    duration = time.perf_counter() - start
+                    log(f"{ctx.key}: CI workflow finished in {format_duration(duration)}", repo=ctx.key)
+                    return sha, duration
                 if conclusion in {"failure", "cancelled", "timed_out", "action_required"}:
                     raise RuntimeError(f"workflow {run_id} ended with {conclusion}: {wf_run.get('url')}")
-                return sha
+                duration = time.perf_counter() - start
+                log(f"{ctx.key}: CI workflow finished in {format_duration(duration)}", repo=ctx.key)
+                return sha, duration
             if self.dry_run:
-                return sha
+                duration = time.perf_counter() - start
+                return sha, duration
             self.gh("run", "watch", run_id, "--repo", self.full_repo(ctx), "--exit-status", capture=False)
-            return sha
+            duration = time.perf_counter() - start
+            log(f"{ctx.key}: CI workflow finished in {format_duration(duration)}", repo=ctx.key)
+            return sha, duration
 
         raise TimeoutError(
             f"workflow did not finish within {timeout_sec}s for {ctx.key} "
@@ -882,12 +993,17 @@ class DeployDaemon:
             return True
         return all(name in names for name in assets)
 
-    def wait_for_release(self, ctx: RepoContext, tag: str, assets: list[str], timeout_sec: int = 7200) -> None:
+    def wait_for_release(self, ctx: RepoContext, tag: str, assets: list[str], timeout_sec: int = 7200) -> float:
         deadline = time.time() + timeout_sec
+        start = time.perf_counter()
         while time.time() < deadline:
             if self.release_ready(ctx, tag, assets):
-                log(f"{ctx.key}: release {tag} ready")
-                return
+                duration = time.perf_counter() - start
+                log(
+                    f"{ctx.key}: release {tag} ready after {format_duration(duration)}",
+                    repo=ctx.key,
+                )
+                return duration
             log(f"{ctx.key}: waiting for release {tag} assets={assets or '(any)'}")
             time.sleep(30)
         raise TimeoutError(f"release {tag} not ready within {timeout_sec}s")
@@ -921,7 +1037,12 @@ class DeployDaemon:
                 else:
                     raise
 
-    def ansible_deploy(self, deploy_cfg: dict[str, Any], *, release_tag: str | None = None) -> None:
+    def ansible_deploy(
+        self,
+        deploy_cfg: dict[str, Any],
+        *,
+        release_tag: str | None = None,
+    ) -> dict[str, Any]:
         script = self.config.stack_root / "scripts" / "ansible-deploy.sh"
         if not script.exists():
             raise FileNotFoundError(script)
@@ -935,8 +1056,32 @@ class DeployDaemon:
             cmd.append(f"--app-tags={','.join(app_tags)}")
         log(f"deploy: {' '.join(cmd)}")
         if self.dry_run:
-            return
-        run(cmd, cwd=self.config.stack_root, capture=False)
+            return {}
+        collector = AnsibleTimingCollector()
+
+        def on_ansible_line(line: str) -> None:
+            collector.feed(line)
+            log(line, repo=_current_repo.get())
+
+        duration = run_streaming(
+            cmd,
+            cwd=self.config.stack_root,
+            env=ansible_profile_callbacks_env(),
+            on_line=on_ansible_line,
+        )
+        timings: dict[str, Any] = {
+            "ansible_deploy_sec": round(duration, 2),
+            **collector.as_dict(),
+        }
+        log(f"deploy finished in {format_duration(duration)}", repo=_current_repo.get())
+        slowest = timings.get("ansible_tasks", [])
+        if slowest:
+            top = slowest[0]
+            log(
+                f"slowest ansible task: {top['task']} ({top['duration_sec']:.1f}s)",
+                repo=_current_repo.get(),
+            )
+        return timings
 
     def process_repo(self, key: str) -> str | None:
         ctx = self.ctx_for(key)
@@ -968,6 +1113,8 @@ class DeployDaemon:
         )
         release_tag: str | None = None
         ci_sha = head_sha
+        timings: dict[str, Any] = {"stages": {}}
+        run_start = time.perf_counter()
 
         if build:
             mode = build.get("mode", "github_actions")
@@ -977,10 +1124,12 @@ class DeployDaemon:
             assets = build.get("release_assets") or []
             artifact = build.get("artifact", "release")
             ci_sha = self.resolve_ci_sha(ctx, head_sha, workflow)
-            ci_sha = self.wait_for_workflow(ctx, ci_sha, workflow)
+            ci_sha, ci_wait_sec = self.wait_for_workflow(ctx, ci_sha, workflow)
+            timings["stages"]["ci_wait_sec"] = round(ci_wait_sec, 2)
             release_tag = self.release_tag_for(build, ci_sha)
             if artifact == "release":
-                self.wait_for_release(ctx, release_tag, assets)
+                release_wait_sec = self.wait_for_release(ctx, release_tag, assets)
+                timings["stages"]["release_wait_sec"] = round(release_wait_sec, 2)
             elif artifact == "ghcr":
                 log(f"CI OK — RAM image expected at GHCR tag {release_tag}", repo=ctx.key)
             elif artifact == "none":
@@ -993,9 +1142,22 @@ class DeployDaemon:
         if deploy_mode == "none":
             log("build-only — skipping Ansible deploy", repo=ctx.key)
         elif deploy_mode == "ansible":
-            self.ansible_deploy(deploy_cfg, release_tag=release_tag)
+            ansible_timings = self.ansible_deploy(deploy_cfg, release_tag=release_tag)
+            timings["stages"].update(ansible_timings)
         else:
             raise RuntimeError(f"unsupported deploy mode: {deploy_mode}")
+
+        total_sec = time.perf_counter() - run_start
+        timings["total_sec"] = round(total_sec, 2)
+        stage_parts = [
+            f"{name}={format_duration(value)}"
+            for name, value in timings["stages"].items()
+        ]
+        log(
+            f"timings: total {format_duration(total_sec)}"
+            + (f" ({', '.join(stage_parts)})" if stage_parts else ""),
+            repo=ctx.key,
+        )
 
         st["last_seen_sha"] = head_sha
         st["last_deployed_sha"] = head_sha
@@ -1003,6 +1165,11 @@ class DeployDaemon:
         if build and release_tag:
             st["last_ci_sha"] = ci_sha
         st["last_deploy_at"] = utc_now()
+        st["last_timings"] = timings
+        st["last_deploy_duration_sec"] = timings["total_sec"]
+        for field in ("ci_wait_sec", "release_wait_sec", "ansible_deploy_sec"):
+            if field in timings["stages"]:
+                st[f"last_{field}"] = timings["stages"][field]
         st.pop("last_error", None)
         self.state.save()
         log(f"complete at {head_sha[:7]}", repo=ctx.key)
@@ -1059,6 +1226,10 @@ class DeployDaemon:
                 "last_deployed_sha",
                 "last_deployed_tag",
                 "last_deploy_at",
+                "last_deploy_duration_sec",
+                "last_ci_wait_sec",
+                "last_release_wait_sec",
+                "last_ansible_deploy_sec",
                 "last_error",
                 "last_error_at",
             ):
@@ -1066,7 +1237,16 @@ class DeployDaemon:
                     val = st[field]
                     if field.endswith("_sha") and isinstance(val, str):
                         val = val[:7]
+                    if field.endswith("_sec") and isinstance(val, (int, float)):
+                        val = format_duration(float(val))
                     print(f"  {field}: {val}")
+            timings = st.get("last_timings")
+            if isinstance(timings, dict):
+                tasks = timings.get("ansible_tasks") or timings.get("stages", {}).get("ansible_tasks")
+                if tasks:
+                    print("  slowest ansible tasks:")
+                    for task in tasks[:5]:
+                        print(f"    - {task['task']}: {task['duration_sec']:.1f}s")
             try:
                 sha = self.latest_sha(self.ctx_for(key))
                 print(f"  remote_head: {sha[:7]}")
@@ -1405,10 +1585,15 @@ def main() -> None:
         deploy_cfg = ctx.cfg.get("deploy") or {}
         if deploy_cfg.get("mode") == "none":
             die(f"{args.repo_key} is build-only (deploy.mode=none)")
-        daemon.ansible_deploy(deploy_cfg, release_tag=args.tag)
+        ansible_timings = daemon.ansible_deploy(deploy_cfg, release_tag=args.tag)
         st = daemon.state.repo(args.repo_key)
         st["last_deployed_tag"] = args.tag
         st["last_deploy_at"] = utc_now()
+        if ansible_timings:
+            st["last_timings"] = {"stages": ansible_timings, "total_sec": ansible_timings.get("ansible_deploy_sec")}
+            st["last_deploy_duration_sec"] = ansible_timings.get("ansible_deploy_sec")
+            if "ansible_deploy_sec" in ansible_timings:
+                st["last_ansible_deploy_sec"] = ansible_timings["ansible_deploy_sec"]
         daemon.state.save()
         return
 
